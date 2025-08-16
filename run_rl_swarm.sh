@@ -402,6 +402,25 @@ if [ "$CONNECT_TO_TESTNET" = true ]; then
     # Проверяем, есть ли данные в modal-login/temp-data
     if [ ! -f "$ROOT/modal-login/temp-data/userData.json" ]; then
         echo_green ">> userData.json not found. Starting anonymous Cloudflare tunnel..."
+        MAX_WAIT=30
+
+        for ((i = 0; i < MAX_WAIT; i++)); do
+            if grep -q "Local:        http://localhost:" $ROOT/logs/yarn.log; then
+                PORT=$(grep "Local:        http://localhost:" $ROOT/logs/yarn.log | sed -n 's/.*http:\/\/localhost:\([0-9]*\).*/\1/p')
+                if [ -n "$PORT" ]; then
+                    echo -e "${GREEN}${BOLD}[✓] Server is running successfully on port $PORT.${NC}"
+                    break
+                fi
+            fi
+            sleep 1
+        done
+
+        if [ $i -eq $MAX_WAIT ]; then
+            echo -e "${RED}${BOLD}[✗] Timeout waiting for server to start.${NC}"
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+        fi
+
         start_tunnel
         if [ $? -eq 0 ]; then
             if [ "$TUNNEL_TYPE" != "localtunnel" ]; then
