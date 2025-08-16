@@ -1,14 +1,9 @@
 #!/bin/bash
+ROOT=$PWD
+RL_DIR=$PWD
 
-# 0) Определяем путь до rl-swarm
-if [ -d "/root/rl-swarm" ]; then
-  RL_DIR="/root/rl-swarm"
-elif [ -d "/workspace/rl-swarm" ]; then
-  RL_DIR="/workspace/rl-swarm"
-else
-  echo "❌ Не найден rl-swarm ни в /root, ни в /workspace"
-  exit 1
-fi
+python3 -m venv .venv
+source .venv/bin/activate
 
 # 1) Подготовка "подменного" rm
 FAKEBIN="$RL_DIR/fakebin"
