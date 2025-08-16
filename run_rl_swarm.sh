@@ -5,6 +5,15 @@ set -euo pipefail
 # General arguments
 ROOT=$PWD
 
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+PURPLE='\033[0;95m'
+BLUE='\033[0;94m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
 # GenRL Swarm version to use
 GENRL_TAG="v0.1.1"
 
@@ -152,59 +161,264 @@ if [ "$CONNECT_TO_TESTNET" = true ]; then
     echo "Started server process: $SERVER_PID"
     sleep 5
 
+    install_localtunnel() {
+        if command -v lt >/dev/null 2>&1; then
+            echo -e "${GREEN}${BOLD}[✓] Localtunnel is already installed.${NC}"
+            return 0
+        fi
+        echo -e "\n${CYAN}${BOLD}[✓] Installing localtunnel...${NC}"
+        npm install -g localtunnel >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}${BOLD}[✓] Localtunnel installed successfully.${NC}"
+            return 0
+        else
+            echo -e "${RED}${BOLD}[✗] Failed to install localtunnel.${NC}"
+            return 1
+        fi
+    }
+
+    install_cloudflared() {
+        if command -v cloudflared >/dev/null 2>&1; then
+            echo -e "${GREEN}${BOLD}[✓] Cloudflared is already installed.${NC}"
+            return 0
+        fi
+        echo -e "\n${YELLOW}${BOLD}[✓] Installing cloudflared...${NC}"
+        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH"
+        wget -q --show-progress "$CF_URL" -O cloudflared
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}${BOLD}[✗] Failed to download cloudflared.${NC}"
+            return 1
+        fi
+        chmod +x cloudflared
+        mv cloudflared /usr/local/bin/
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}${BOLD}[✗] Failed to move cloudflared to /usr/local/bin/.${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}${BOLD}[✓] Cloudflared installed successfully.${NC}"
+        return 0
+    }
+
+    install_ngrok() {
+        if command -v ngrok >/dev/null 2>&1; then
+            echo -e "${GREEN}${BOLD}[✓] ngrok is already installed.${NC}"
+            return 0
+        fi
+        echo -e "${YELLOW}${BOLD}[✓] Installing ngrok...${NC}"
+        NGROK_URL="https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$OS-$NGROK_ARCH.tgz"
+        wget -q --show-progress "$NGROK_URL" -O ngrok.tgz
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}${BOLD}[✗] Failed to download ngrok.${NC}"
+            return 1
+        fi
+        tar -xzf ngrok.tgz
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}${BOLD}[✗] Failed to extract ngrok.${NC}"
+            rm ngrok.tgz
+            return 1
+        fi
+        mv ngrok /usr/local/bin/
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}${BOLD}[✗] Failed to move ngrok to /usr/local/bin/.${NC}"
+            rm ngrok.tgz
+            return 1
+        fi
+        rm ngrok.tgz
+        echo -e "${GREEN}${BOLD}[✓] ngrok installed successfully.${NC}"
+        return 0
+    }
+
+    try_localtunnel() {
+        echo -e "\n${CYAN}${BOLD}[✓] Trying localtunnel...${NC}"
+        if install_localtunnel; then
+            echo -e "\n${CYAN}${BOLD}[✓] Starting localtunnel on port $PORT...${NC}"
+            TUNNEL_TYPE="localtunnel"
+            lt --port $PORT >localtunnel_output.log 2>&1 &
+            TUNNEL_PID=$!
+
+            sleep 5
+            URL=$(grep -o "https://[^ ]*" localtunnel_output.log | head -n1)
+
+            if [ -n "$URL" ]; then
+                PASS=$(curl -s https://loca.lt/mytunnelpassword)
+                FORWARDING_URL="$URL"
+                echo -e "${GREEN}${BOLD}[✓] Success! Please visit this website : ${YELLOW}${BOLD}${URL}${GREEN}${BOLD} and then enter this password : ${YELLOW}${BOLD}${PASS}${GREEN}${BOLD} to access the website and then log in using your email.${NC}"
+                return 0
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to get localtunnel URL.${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+            fi
+        fi
+        return 1
+    }
+
+    try_cloudflared() {
+        echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
+        if install_cloudflared; then
+            echo -e "\n${CYAN}${BOLD}[✓] Starting cloudflared tunnel...${NC}"
+            TUNNEL_TYPE="cloudflared"
+            cloudflared tunnel --url http://localhost:$PORT >cloudflared_output.log 2>&1 &
+            TUNNEL_PID=$!
+
+            counter=0
+            MAX_WAIT=10
+            while [ $counter -lt $MAX_WAIT ]; do
+                CLOUDFLARED_URL=$(grep -o 'https://[^ ]*\.trycloudflare.com' cloudflared_output.log | head -n1)
+                if [ -n "$CLOUDFLARED_URL" ]; then
+                    echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel is started successfully.${NC}"
+                    echo -e "\n${CYAN}${BOLD}[✓] Checking if cloudflared URL is working...${NC}"
+                    if check_url "$CLOUDFLARED_URL"; then
+                        FORWARDING_URL="$CLOUDFLARED_URL"
+                        return 0
+                    else
+                        echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible.${NC}"
+                        kill $TUNNEL_PID 2>/dev/null || true
+                        break
+                    fi
+                fi
+                sleep 1
+                counter=$((counter + 1))
+            done
+            kill $TUNNEL_PID 2>/dev/null || true
+        fi
+        return 1
+    }
+
+    get_ngrok_url_method1() {
+        local url=$(grep -o '"url":"https://[^"]*' ngrok_output.log 2>/dev/null | head -n1 | cut -d'"' -f4)
+        echo "$url"
+    }
+
+    get_ngrok_url_method2() {
+        local try_port
+        local url=""
+        for try_port in $(seq 4040 4045); do
+            local response=$(curl -s "http://localhost:$try_port/api/tunnels" 2>/dev/null)
+            if [ -n "$response" ]; then
+                url=$(echo "$response" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
+                if [ -n "$url" ]; then
+                    break
+                fi
+            fi
+        done
+        echo "$url"
+    }
+
+    get_ngrok_url_method3() {
+        local url=$(grep -o "Forwarding.*https://[^ ]*" ngrok_output.log 2>/dev/null | grep -o "https://[^ ]*" | head -n1)
+        echo "$url"
+    }
+
+    try_ngrok() {
+        echo -e "\n${CYAN}${BOLD}[✓] Trying ngrok...${NC}"
+        if install_ngrok; then
+            TUNNEL_TYPE="ngrok"
+            while true; do
+                echo -e "\n${YELLOW}${BOLD}To get your authtoken:${NC}"
+                echo "1. Sign up or log in at https://dashboard.ngrok.com"
+                echo "2. Go to 'Your Authtoken' section: https://dashboard.ngrok.com/get-started/your-authtoken"
+                echo "3. Click on the eye icon to reveal your ngrok auth token"
+                echo "4. Copy that auth token and paste it in the prompt below"
+                echo -e "\n${BOLD}Please enter your ngrok authtoken:${NC}"
+                read -p "> " NGROK_TOKEN
+
+                if [ -z "$NGROK_TOKEN" ]; then
+                    echo -e "${RED}${BOLD}[✗] No token provided. Please enter a valid token.${NC}"
+                    continue
+                fi
+                pkill -f ngrok || true
+                sleep 2
+
+                ngrok authtoken "$NGROK_TOKEN" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}${BOLD}[✓] Successfully authenticated ngrok!${NC}"
+                    break
+                else
+                    echo -e "${RED}[✗] Authentication failed. Please check your token and try again.${NC}"
+                fi
+            done
+
+            echo -e "\n${CYAN}${BOLD}[✓] Starting ngrok with method 1...${NC}"
+            ngrok http "$PORT" --log=stdout --log-format=json >ngrok_output.log 2>&1 &
+            TUNNEL_PID=$!
+            sleep 5
+
+            NGROK_URL=$(get_ngrok_url_method1)
+            if [ -n "$NGROK_URL" ]; then
+                FORWARDING_URL="$NGROK_URL"
+                return 0
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to get ngrok URL (method 1).${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+            fi
+
+            echo -e "\n${CYAN}${BOLD}[✓] Starting ngrok with method 2...${NC}"
+            ngrok http "$PORT" >ngrok_output.log 2>&1 &
+            TUNNEL_PID=$!
+            sleep 5
+
+            NGROK_URL=$(get_ngrok_url_method2)
+            if [ -n "$NGROK_URL" ]; then
+                FORWARDING_URL="$NGROK_URL"
+                return 0
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to get ngrok URL (method 2).${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+            fi
+
+            echo -e "\n${CYAN}${BOLD}[✓] Starting ngrok with method 3...${NC}"
+            ngrok http "$PORT" --log=stdout >ngrok_output.log 2>&1 &
+            TUNNEL_PID=$!
+            sleep 5
+
+            NGROK_URL=$(get_ngrok_url_method3)
+            if [ -n "$NGROK_URL" ]; then
+                FORWARDING_URL="$NGROK_URL"
+                return 0
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to get ngrok URL (method 3).${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+            fi
+        fi
+        return 1
+    }
+
+    start_tunnel() {
+        if try_localtunnel; then
+            return 0
+        fi
+
+        if try_cloudflared; then
+            return 0
+        fi
+
+        if try_ngrok; then
+            return 0
+        fi
+        return 1
+    }
+
+
     # Проверяем, есть ли данные в modal-login/temp-data
     if [ ! -f "$ROOT/modal-login/temp-data/userData.json" ]; then
         echo_green ">> userData.json not found. Starting anonymous Cloudflare tunnel..."
-    
-        # Установка cloudflared (Ubuntu/WSL → apt, macOS → brew, иначе пытаемся snap)
-        if ! command -v cloudflared >/dev/null 2>&1; then
-            if grep -qi "ubuntu" /etc/os-release 2>/dev/null || uname -r | grep -qi "microsoft"; then
-                echo "Installing cloudflared via apt..."
-                sudo mkdir -p --mode=0755 /usr/share/keyrings
-                curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-                echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(. /etc/os-release && echo $VERSION_CODENAME) main" \
-                  | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
-                sudo apt update && sudo apt install -y cloudflared
-            elif command -v brew >/dev/null 2>&1; then
-                echo "Installing cloudflared via Homebrew..."
-                brew install cloudflared
-            elif command -v snap >/dev/null 2>&1; then
-                echo "Installing cloudflared via snap..."
-                sudo snap install cloudflared
-            else
-                echo_red "cloudflared not found and auto-install is unsupported on this OS. Install it manually and re-run."
-                exit 1
+        start_tunnel
+        if [ $? -eq 0 ]; then
+            if [ "$TUNNEL_TYPE" != "localtunnel" ]; then
+                echo -e "${GREEN}${BOLD}[✓] Success! Please visit this website and log in using your email:${NC} ${CYAN}${BOLD}${FORWARDING_URL}${NC}"
             fi
-        fi
-    
-        # Запуск анонимного туннеля. Логи — в файл, чтобы вытащить публичный URL
-        echo_green ">> Starting Cloudflare Quick Tunnel for $TUNNEL_LOCAL_URL ..."
-        cloudflared tunnel --no-autoupdate --url "$TUNNEL_LOCAL_URL" > "$ROOT/logs/cloudflared.log" 2>&1 &
-        CLOUDFLARED_PID=$!
-    
-        # Ждём появления URL в логах (обычно строка с https://*.trycloudflare.com)
-        echo_green ">> Waiting for Cloudflare tunnel URL..."
-        PUBLIC_URL=""
-        for i in {1..30}; do
-            if grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$ROOT/logs/cloudflared.log" >/dev/null 2>&1; then
-                PUBLIC_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$ROOT/logs/cloudflared.log" | head -n1)
-                break
-            fi
-            sleep 1
-        done
-    
-        SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-        echo "Server IP: ${SERVER_IP:-unknown}"
-    
-        if [ -n "$PUBLIC_URL" ]; then
-            echo_green ">> Your public tunnel is: $PUBLIC_URL"
-            echo "Open this URL to access the login page."
         else
-            echo_red ">> Failed to obtain public URL. See $ROOT/logs/cloudflared.log"
+            echo -e "\n${BLUE}${BOLD}[✓] Don't worry, you can use this manual method. Please follow these instructions:${NC}"
+            echo "1. Open this same WSL/VPS or GPU server on another tab"
+            echo "2. Paste this command into this terminal: ngrok http $PORT"
+            echo "3. It will show a link similar to this: https://xxxx.ngrok-free.app"
+            echo "4. Visit this website and login using your email, this website may take 30 sec to load."
+            echo "5. Now go back to the previous tab, you will see everything will run fine"
         fi
+
     else
         echo_green ">> User data found. Skipping tunnel."
-    
+
         # Try to open the URL in the default browser if not in Docker
         if [ -z "$DOCKER" ]; then
             if open http://localhost:3000 2> /dev/null; then
@@ -302,7 +516,7 @@ echo_green ">> Good luck in the swarm!"
 echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
 
 python -m rgym_exp.runner.swarm_launcher \
-    --config-path "$ROOT/rgym_exp/config" \
-    --config-name "rg-swarm.yaml" 
+--config-path "$ROOT/rgym_exp/config" \
+--config-name "rg-swarm.yaml"
 
 wait  # Keep script running until Ctrl+C
